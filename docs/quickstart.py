@@ -94,6 +94,7 @@ inp = input("Ready to begin example #2?")
 ### EXAMPLE 2
 ##############################
 
+
 @tool
 def multiply(first_number: int, second_number: int):
     """Multiplies two numbers together."""
@@ -119,7 +120,7 @@ def invoke_model(state: List[BaseMessage]):
     return model_with_tools.invoke(state)
 
 
-graph.add_node("oracle", invoke_model)
+
 
 
 def invoke_tool(state: List[BaseMessage]):
@@ -137,11 +138,9 @@ def invoke_tool(state: List[BaseMessage]):
 
     return ToolMessage(tool_call_id=multiply_call.get("id"), content=res)
 
-
+graph.add_node("oracle", invoke_model)
 graph.add_node("multiply", invoke_tool)
-
 graph.add_edge("multiply", END)
-
 graph.set_entry_point("oracle")
 
 
