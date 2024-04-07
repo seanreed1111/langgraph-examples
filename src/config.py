@@ -11,3 +11,4 @@ def run_azure_config(config_dir):
         config.update(json.load(json_config))
         for k in config:
             os.environ[k] = config[k]
+    return True
