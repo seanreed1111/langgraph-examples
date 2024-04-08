@@ -2,142 +2,187 @@
 # coding: utf-8
 
 # # LLMCompiler
-# 
+#
 # This notebook shows how to implement [LLMCompiler, by Kim, et. al](https://arxiv.org/abs/2312.04511) in LangGraph.
-# 
+#
 # LLMCompiler is an agent architecture designed to **speed up** the execution of agentic tasks by eagerly-executed tasks within a DAG. It also saves costs on redundant token usage by reducing the number of calls to the LLM. Below is an overview of its computational graph:
-# 
+#
 # ![LLMCompiler Graph](./img/llm-compiler.png)
-# 
+#
 # It has 3 main components:
-# 
+#
 # 1. Planner: stream a DAG of tasks.
 # 2. Task Fetching Unit: schedules and executes the tasks as soon as they are executable
 # 3. Joiner: Responds to the user or triggers a second plan
-# 
-# 
+#
+#
 # This notebook walks through each component and shows how to wire them together using LangGraph. The end result will leave a trace [like the following](https://smith.langchain.com/public/218c2677-c719-4147-b0e9-7bc3b5bb2623/r).
-# 
-# 
+#
+#
 # **First,** install the dependencies, and set up LangSmith for tracing to more easily debug and observe the agent.
-
-# In[1]:
-
-
-# %pip install -U --quiet langchain_openai langsmith langgraph langchain numexpr
-
-
-# In[1]:
-
-
+import datetime
+import itertools
+import json
 import os
-import getpass
+import re
+import sys
+import tempfile
+import time
+import traceback
+from concurrent.futures import ThreadPoolExecutor, wait
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Sequence, Tuple, Union
+
+from langchain import hub
+from langchain.chains.openai_functions import create_structured_output_runnable
+from langchain_community.tools.tavily_search import TavilySearchResults
+from langchain_core.language_models import BaseChatModel
+from langchain_core.messages import (
+    AIMessage,
+    BaseMessage,
+    FunctionMessage,
+    HumanMessage,
+    SystemMessage,
+    ToolMessage,
+)
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.pydantic_v1 import BaseModel, Field
+from langchain_core.runnables import RunnableBranch
+from langchain_core.runnables import (
+    chain as as_runnable,
+)
+from langchain_core.tools import BaseTool#, tool
+# from langchain_core.utils.function_calling import convert_to_openai_tool
+from langchain_openai import AzureChatOpenAI
+from langgraph.graph import END, MessageGraph
+from loguru import logger
+from math_tools import get_math_tool
+from output_parser import LLMCompilerPlanParser, Task
+from typing_extensions import TypedDict
+
+if "src" not in sys.path:
+    sys.path.append("../src")  # needed to get the azure config imports to run
+from config import LOCAL_CONFIG_DIR, run_azure_config
+
+RECURSION_LIMIT = 80
+
+run_azure_config(LOCAL_CONFIG_DIR)
+
+now = str(datetime.date.today())
+temp_dir_path = tempfile.mkdtemp(prefix=now)
+# log_file_name = "quickstart.ipynb.log"  # only for notebooks
+log_file_name = Path(__file__).stem + ".log"  # only for scripts
+log_file_path = (
+    Path(temp_dir_path) / log_file_name
+)  # appends automatically if file exists
+
+# logger.info(f"created {temp_dir_path=}")
+log_level = "DEBUG"
+log_format = "<green>{time:YYYY-MM-DD HH:mm:ss.SSS zz}</green> | <level>{level: <8}</level> | <yellow>Line {line: >4} ({file}):</yellow> <b>{message}</b>"
+logger.add(
+    sys.stderr,
+    level=log_level,
+    format=log_format,
+    colorize=True,
+    backtrace=True,
+    diagnose=True,
+)
+logger.add(
+    log_file_path,
+    level=log_level,
+    format=log_format,
+    colorize=False,
+    backtrace=True,
+    diagnose=True,
+)
 
 
-def _get_pass(var: str):
-    if var not in os.environ:
-        os.environ[var] = getpass.getpass(f"{var}: ")
+use_gpt_4 = input("Use GPT 4? (y or n)").lower()
+if use_gpt_4 == "y":
+    model_name = os.getenv("MODEL_NAME_GPT")
+    deployment_name = os.getenv("AZURE_OPENAI_API_DEPLOYMENT_NAME_GPT")
+    logger.info("using gpt 4")
+else:
+    model_name = os.getenv("MODEL_NAME_GPT35")
+    deployment_name = os.getenv("AZURE_OPENAI_API_DEPLOYMENT_NAME_GPT35")
+    logger.info("using gpt 3.5")
 
-
-# Optional: Debug + trace calls using LangSmith
-os.environ["LANGCHAIN_TRACING_V2"] = "True"
-os.environ["LANGCHAIN_PROJECT"] = "LLMCompiler"
-_get_pass("LANGCHAIN_API_KEY")
-_get_pass("OPENAI_API_KEY")
+os.environ["LANGCHAIN_PROJECT"] = (
+    f"{Path(__file__).stem}-langgraph-examples-dir-{model_name}"
+)
 
 
 # ## Part 1: Tools
-# 
+#
 # We'll first define the tools for the agent to use in our demo. We'll give it the class search engine + calculator combo.
-# 
+#
 # If you don't want to sign up for tavily, you can replace it with the free [DuckDuckGo](https://python.langchain.com/docs/integrations/tools/ddg).
 
-# In[3]:
-
-
-from langchain_openai import ChatOpenAI
-from langchain_community.tools.tavily_search import TavilySearchResults
-
 # Imported from the https://github.com/langchain-ai/langgraph/tree/main/examples/plan-and-execute repo
-from math_tools import get_math_tool
 
-_get_pass("TAVILY_API_KEY")
+# EXAMPLE 1
+llm = AzureChatOpenAI(
+    temperature=0.05,
+    streaming=True,
+    model_name=model_name,
+    azure_deployment=deployment_name,
+    azure_endpoint=os.environ["AZURE_OPENAI_API_ENDPOINT"],
+    openai_api_version=os.environ["AZURE_OPENAI_API_VERSION"],
+    request_timeout=120,
+    verbose=False,
+)
 
-calculate = get_math_tool(ChatOpenAI(model="gpt-4-turbo-preview"))
+calculate = get_math_tool(llm)
 search = TavilySearchResults(
-    max_results=1,
+    max_results=5,
     description='tavily_search_results_json(query="the search query") - a search engine.',
 )
 
 tools = [search, calculate]
 
-
-# In[4]:
-
-
 calculate.invoke(
     {
-        "problem": "What's the temp of sf + 5?",
-        "context": ["Thet empreature of sf is 32 degrees"],
+        "problem": "What's the temp of Denver + 5?",
+        "context": ["The temperature of Denver is 32 degrees"],
     }
 )
 
-
 # # Part 2: Planner
-# 
-# 
+#
+#
 # Largely adapted from [the original source code](https://github.com/SqueezeAILab/LLMCompiler/blob/main/src/llm_compiler/output_parser.py), the planner  accepts the input question and generates a task list to execute.
-# 
+#
 # If it is provided with a previous plan, it is instructed to re-plan, which is useful if, upon completion of the first batch of tasks, the agent must take more actions.
-# 
+#
 # The code below composes constructs the prompt template for the planner and composes it with LLM and output parser, defined in [output_parser.py](./output_parser.py). The output parser processes a task list in the following form:
-# 
+#
 # ```plaintext
 # 1. tool_1(arg1="arg1", arg2=3.5, ...)
 # Thought: I then want to find out Y by using tool_2
 # 2. tool_2(arg1="", arg2="${1}")'
 # 3. join()<END_OF_PLAN>"
 # ```
-# 
+#
 # The "Thought" lines are optional. The `${#}` placeholders are variables. These are used to route tool (task) outputs to other tools.
-
-# In[5]:
-
-
-from typing import Sequence
-
-from langchain_core.language_models import BaseChatModel
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.runnables import RunnableBranch
-from langchain_core.tools import BaseTool
-from langchain_core.messages import (
-    BaseMessage,
-    FunctionMessage,
-    HumanMessage,
-    SystemMessage,
-)
-
-from output_parser import LLMCompilerPlanParser, Task
-from langchain import hub
-from langchain_openai import ChatOpenAI
-
 
 prompt = hub.pull("wfh/llm-compiler")
 print(prompt.pretty_print())
 
 
-# In[6]:
-
-
+@logger.catch
 def create_planner(
     llm: BaseChatModel, tools: Sequence[BaseTool], base_prompt: ChatPromptTemplate
 ):
     tool_descriptions = "\n".join(
-        f"{i+1}. {tool.description}\n" for i, tool in enumerate(tools) # +1 to offset the 0 starting index, we want it count normally from 1.
+        f"{i+1}. {included_tool.description}\n"
+        for i, included_tool in enumerate(
+            tools
+        )  # +1 to offset the 0 starting index, we want it count normally from 1.
     )
     planner_prompt = base_prompt.partial(
         replan="",
-        num_tools=len(tools)+1, # Add one because we're adding the join() tool at the end.
+        num_tools=len(tools)
+        + 1,  # Add one because we're adding the join() tool at the end.
         tool_descriptions=tool_descriptions,
     )
     replanner_prompt = base_prompt.partial(
@@ -147,7 +192,7 @@ def create_planner(
         ' - When starting the Current Plan, you should start with "Thought" that outlines the strategy for the next plan.\n'
         " - In the Current Plan, you should NEVER repeat the actions that are already executed in the Previous Plan.\n"
         " - You must continue the task index from the end of the previous one. Do not repeat task indices.",
-        num_tools=len(tools)+1,
+        num_tools=len(tools) + 1,
         tool_descriptions=tool_descriptions,
     )
 
@@ -177,18 +222,10 @@ def create_planner(
     )
 
 
-# In[7]:
-
-
-llm = ChatOpenAI(model="gpt-4-turbo-preview")
 # This is the primary "agent" in our application
 planner = create_planner(llm, tools, prompt)
 
-
-# In[8]:
-
-
-example_question = "What's the temperature in SF raised to the 3rd power?"
+example_question = "What's the temperature in Denver raised to the 2rd power?"
 
 for task in planner.stream([HumanMessage(content=example_question)]):
     print(task["tool"], task["args"])
@@ -196,36 +233,21 @@ for task in planner.stream([HumanMessage(content=example_question)]):
 
 
 # ## 3. Task Fetching Unit
-# 
+#
 # This component schedules the tasks. It receives a stream of tools of the following format:
-# 
+#
 # ```typescript
 # {
 #     tool: BaseTool,
 #     dependencies: number[],
 # }
 # ```
-# 
-# 
+#
+#
 # The basic idea is to begin executing tools as soon as their dependencies are met. This is done through multi-threading. We will combine the task fetching unit and exector below:
-# 
+#
 # ![diagram](./img/diagram.png)
-
-# In[9]:
-
-
-from typing import Any, Union, Iterable, List, Tuple, Dict
-from typing_extensions import TypedDict
-import re
-
-from langchain_core.runnables import (
-    chain as as_runnable,
-)
-
-from concurrent.futures import ThreadPoolExecutor, wait
-import time
-
-
+@logger.catch
 def _get_observations(messages: List[BaseMessage]) -> Dict[int, Any]:
     # Get all previous tool responses
     results = {}
@@ -240,6 +262,7 @@ class SchedulerInput(TypedDict):
     tasks: Iterable[Task]
 
 
+@logger.catch
 def _execute_task(task, observations, config):
     tool_to_use = task["tool"]
     if isinstance(tool_to_use, str):
@@ -269,6 +292,7 @@ def _execute_task(task, observations, config):
         )
 
 
+@logger.catch
 def _resolve_arg(arg: Union[str, Any], observations: Dict[int, Any]):
     # $1 or ${1} -> 1
     ID_PATTERN = r"\$\{?(\d+)\}?"
@@ -291,18 +315,19 @@ def _resolve_arg(arg: Union[str, Any], observations: Dict[int, Any]):
 
 
 @as_runnable
+@logger.catch
 def schedule_task(task_inputs, config):
     task: Task = task_inputs["task"]
     observations: Dict[int, Any] = task_inputs["observations"]
     try:
         observation = _execute_task(task, observations, config)
     except Exception:
-        import traceback
 
         observation = traceback.format_exception()  # repr(e) +
     observations[task["idx"]] = observation
 
 
+@logger.catch
 def schedule_pending_task(
     task: Task, observations: Dict[int, Any], retry_after: float = 0.2
 ):
@@ -317,6 +342,7 @@ def schedule_pending_task(
 
 
 @as_runnable
+@logger.catch
 def schedule_tasks(scheduler_input: SchedulerInput) -> List[FunctionMessage]:
     """Group the tasks into a DAG schedule."""
     # For streaming, we are making a few simplifying assumption:
@@ -343,11 +369,10 @@ def schedule_tasks(scheduler_input: SchedulerInput) -> List[FunctionMessage]:
             task_names[task["idx"]] = (
                 task["tool"] if isinstance(task["tool"], str) else task["tool"].name
             )
-            args_for_tasks[task["idx"]] = (task["args"])
+            args_for_tasks[task["idx"]] = task["args"]
             if (
                 # Depends on other tasks
-                deps
-                and (any([dep not in observations for dep in deps]))
+                deps and (any([dep not in observations for dep in deps]))
             ):
                 futures.append(
                     executor.submit(
@@ -369,19 +394,16 @@ def schedule_tasks(scheduler_input: SchedulerInput) -> List[FunctionMessage]:
         for k in sorted(observations.keys() - originals)
     }
     tool_messages = [
-        FunctionMessage(name=name, content=str(obs), additional_kwargs={"idx": k, 'args':task_args})
+        FunctionMessage(
+            name=name, content=str(obs), additional_kwargs={"idx": k, "args": task_args}
+        )
         for k, (name, task_args, obs) in new_observations.items()
     ]
     return tool_messages
 
 
-# In[10]:
-
-
-import itertools
-
-
 @as_runnable
+@logger.catch
 def plan_and_schedule(messages: List[BaseMessage], config):
     tasks = planner.stream(messages, config)
     # Begin executing the planner immediately
@@ -401,36 +423,23 @@ def plan_and_schedule(messages: List[BaseMessage], config):
 
 
 # #### Example Plan
-# 
+#
 # We still haven't introduced any cycles in our computation graph, so this is all easily expressed in LCEL.
-
-# In[11]:
-
 
 tool_messages = plan_and_schedule.invoke([HumanMessage(content=example_question)])
 
 
-# In[12]:
+# tool_messages
 
 
-tool_messages
-
-
-# ## 4. "Joiner" 
-# 
+# ## "Joiner"
+#
 # So now we have the planning and initial execution done. We need a component to process these outputs and either:
-# 
+#
 # 1. Respond with the correct answer.
 # 2. Loop with a new plan.
-# 
+#
 # The paper refers to this as the "joiner". It's another LLM call. We are using function calling to improve parsing reliability.
-
-# In[13]:
-
-
-from langchain_core.pydantic_v1 import BaseModel, Field
-from langchain.chains.openai_functions import create_structured_output_runnable
-from langchain_core.messages import AIMessage
 
 
 class FinalResponse(BaseModel):
@@ -457,7 +466,7 @@ class JoinOutputs(BaseModel):
 joiner_prompt = hub.pull("wfh/llm-compiler-joiner").partial(
     examples=""
 )  # You can optionally add examples
-llm = ChatOpenAI(model="gpt-4-turbo-preview")
+# llm = ChatOpenAI(model="gpt-4-turbo-preview")
 
 runnable = create_structured_output_runnable(JoinOutputs, llm, joiner_prompt)
 
@@ -465,9 +474,8 @@ runnable = create_structured_output_runnable(JoinOutputs, llm, joiner_prompt)
 # We will select only the most recent messages in the state, and format the output to be more useful for
 # the planner, should the agent need to loop.
 
-# In[14]:
 
-
+@logger.catch
 def _parse_joiner_output(decision: JoinOutputs) -> List[BaseMessage]:
     response = [AIMessage(content=f"Thought: {decision.thought}")]
     if isinstance(decision.action, Replan):
@@ -480,6 +488,7 @@ def _parse_joiner_output(decision: JoinOutputs) -> List[BaseMessage]:
         return response + [AIMessage(content=decision.action.response)]
 
 
+@logger.catch
 def select_recent_messages(messages: list) -> dict:
     selected = []
     for msg in messages[::-1]:
@@ -491,46 +500,24 @@ def select_recent_messages(messages: list) -> dict:
 
 joiner = select_recent_messages | runnable | _parse_joiner_output
 
-
-# In[15]:
-
-
 input_messages = [HumanMessage(content=example_question)] + tool_messages
-
-
-# In[16]:
 
 
 joiner.invoke(input_messages)
 
 
 # ## 5. Compose using LangGraph
-# 
+#
 # We'll define the agent as a stateful graph, with the main nodes being:
-# 
+#
 # 1. Plan and execute (the DAG from the first step above)
 # 2. Join: determine if we should finish or replan
 # 3. Recontextualize: update the graph state based on the output from the joiner
 
-# In[17]:
-
-
-from langgraph.graph import MessageGraph, END
-from typing import Dict
-
 graph_builder = MessageGraph()
-
-# 1.  Define vertices
-# We defined plan_and_schedule above already
-# Assign each node to a state variable to update
 graph_builder.add_node("plan_and_schedule", plan_and_schedule)
 graph_builder.add_node("join", joiner)
-
-
-## Define edges
 graph_builder.add_edge("plan_and_schedule", "join")
-
-### This condition determines looping logic
 
 
 def should_continue(state: List[BaseMessage]):
@@ -548,87 +535,71 @@ graph_builder.set_entry_point("plan_and_schedule")
 chain = graph_builder.compile()
 
 
-# #### Simple question
-# 
-# Let's ask a simple question of the agent.
-
-# In[18]:
-
-
-for step in chain.stream([HumanMessage(content="What's the GDP of New York?")]):
-    print(step)
-    print("---")
-
-
-# In[19]:
-
-
-# Final answer
-print(step[END][-1].content)
-
-
 # #### Multi-hop question
-# 
-# This question requires that the agent perform multiple searches.
-
-# In[20]:
-
-
-steps = chain.stream(
-    [
-        HumanMessage(
-            content="What's the oldest parrot alive, and how much longer is that than the average?"
-        )
-    ],
-    {
-        "recursion_limit": 100,
-    },
-)
-for step in steps:
-    print(step)
-    print("---")
-
-
-# In[21]:
-
-
-# Final answer
-print(step[END][-1].content)
-
-
-# #### Multi-step  math
-
-# In[22]:
-
 
 for step in chain.stream(
     [
         HumanMessage(
-            content="What's ((3*(4+5)/0.5)+3245) + 8? What's 32/4.23? What's the sum of those two values?"
+            content="What was the GDP of Australia in 2020 in in Billions of US Dollars? \
+     What was the GDP of Canada in 2020 in Billions of US Dollars? Which country has the larger GDP? \
+        What is the sum of the GDPs of the two countries, in Billions of US Dollars"
         )
-    ]
+    ],
+    {
+        "recursion_limit": RECURSION_LIMIT,
+    },
 ):
     print(step)
+    print("---")
 
 
-# In[23]:
+# #### Multi-hop question
+#
+# This question requires that the agent perform multiple searches.
+
+steps = chain.stream(
+    [
+        HumanMessage(
+            content="Who is the oldest person alive? and how much older is that person than the average human lifespan \
+                in the country where they were born ?"
+        )
+    ],
+    {
+        "recursion_limit": RECURSION_LIMIT,
+    },
+)
+for i, step in enumerate(steps):
+    print(i, step)
+    print("---")
 
 
-# Final answer
-print(step[END][-1].content)
+# Next Question
+for i,step in enumerate(chain.stream(
+    [
+        HumanMessage(
+            content="What's (3*3245) + 8? What's 32/4.23? What's the sum of those two values?"
+        )
+    ],
+    {
+        "recursion_limit": RECURSION_LIMIT,
+    },
+)):
+    # print(f"\nstep{i}:{str(step)}")
+    print("---")
+    logger.info(f"\nstep{i}:{str(step)}")
 
 
 # ## Conclusion
-# 
-# Congrats on building your first LLMCompiler agent! I'll leave you with some known limitations to the implementation above:
-# 
-# 1. The planner output parsing format is fragile if your function requires more than 1 or 2 arguments. We could make it more robust by using streaming tool calling.
-# 2. Variable substitution is fragile in the example above. It could be made more robust by using a fine-tuned model and a more robust syntax (using e.g., Lark or a tool calling schema)
-# 3. The state can grow quite long if you require multiple re-planning runs. To handle, you could add a message compressor once you go above a certain token limit.
-# 
-
-# In[ ]:
-
-
-
-
+#
+# Congrats on building your first LLMCompiler agent! 
+# I'll leave you with some known limitations to the implementation above:
+#
+'''
+# 1. The planner output parsing format is fragile if your function requires more than 1 or 2 arguments. 
+    # We could make it more robust by using streaming tool calling.
+# 2. Variable substitution is fragile in the example above. 
+    # It could be made more robust by using a fine-tuned model 
+    # and a more robust syntax (using e.g., Lark or a tool calling schema)
+# 3. The state can grow quite long if you require multiple re-planning runs. 
+    # To handle, you could add a message compressor once you go above a certain token limit.
+'''
