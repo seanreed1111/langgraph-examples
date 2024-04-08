@@ -51,7 +51,8 @@ from langchain_core.runnables import RunnableBranch
 from langchain_core.runnables import (
     chain as as_runnable,
 )
-from langchain_core.tools import BaseTool#, tool
+from langchain_core.tools import BaseTool  # , tool
+
 # from langchain_core.utils.function_calling import convert_to_openai_tool
 from langchain_openai import AzureChatOpenAI
 from langgraph.graph import END, MessageGraph
@@ -64,19 +65,16 @@ if "src" not in sys.path:
     sys.path.append("../src")  # needed to get the azure config imports to run
 from config import LOCAL_CONFIG_DIR, run_azure_config
 
-RECURSION_LIMIT = 80
+RECURSION_LIMIT = 10
 
 run_azure_config(LOCAL_CONFIG_DIR)
 
-now = str(datetime.date.today())
-temp_dir_path = tempfile.mkdtemp(prefix=now)
-# log_file_name = "quickstart.ipynb.log"  # only for notebooks
-log_file_name = Path(__file__).stem + ".log"  # only for scripts
-log_file_path = (
-    Path(temp_dir_path) / log_file_name
-)  # appends automatically if file exists
+# now = str(datetime.date.today())
+log_dir = Path.home() / "PythonProjects" / "logs"
+log_dir.mkdir(exist_ok=True, parents=True)
+log_file_name = Path(__file__).stem + ".log"
+log_file_path = log_dir / log_file_name
 
-# logger.info(f"created {temp_dir_path=}")
 log_level = "DEBUG"
 log_format = "<green>{time:YYYY-MM-DD HH:mm:ss.SSS zz}</green> | <level>{level: <8}</level> | <yellow>Line {line: >4} ({file}):</yellow> <b>{message}</b>"
 logger.add(
@@ -115,10 +113,7 @@ os.environ["LANGCHAIN_PROJECT"] = (
 # ## Part 1: Tools
 #
 # We'll first define the tools for the agent to use in our demo. We'll give it the class search engine + calculator combo.
-#
-# If you don't want to sign up for tavily, you can replace it with the free [DuckDuckGo](https://python.langchain.com/docs/integrations/tools/ddg).
 
-# Imported from the https://github.com/langchain-ai/langgraph/tree/main/examples/plan-and-execute repo
 
 # EXAMPLE 1
 llm = AzureChatOpenAI(
@@ -134,18 +129,18 @@ llm = AzureChatOpenAI(
 
 calculate = get_math_tool(llm)
 search = TavilySearchResults(
-    max_results=5,
+    max_results=10,
     description='tavily_search_results_json(query="the search query") - a search engine.',
 )
 
 tools = [search, calculate]
 
-calculate.invoke(
-    {
-        "problem": "What's the temp of Denver + 5?",
-        "context": ["The temperature of Denver is 32 degrees"],
-    }
-)
+# calculate.invoke(
+#     {
+#         "problem": "What's the temp of Denver + 5?",
+#         "context": ["The temperature of Denver is 32 degrees"],
+#     }
+# )
 
 # # Part 2: Planner
 #
@@ -166,7 +161,8 @@ calculate.invoke(
 # The "Thought" lines are optional. The `${#}` placeholders are variables. These are used to route tool (task) outputs to other tools.
 
 prompt = hub.pull("wfh/llm-compiler")
-print(prompt.pretty_print())
+print("prompt is", prompt.pretty_print())
+logger.info(f"\nHere is the llm-compiler prompt {str(prompt)}\n")
 
 
 @logger.catch
@@ -231,22 +227,6 @@ for task in planner.stream([HumanMessage(content=example_question)]):
     print(task["tool"], task["args"])
     print("---")
 
-
-# ## 3. Task Fetching Unit
-#
-# This component schedules the tasks. It receives a stream of tools of the following format:
-#
-# ```typescript
-# {
-#     tool: BaseTool,
-#     dependencies: number[],
-# }
-# ```
-#
-#
-# The basic idea is to begin executing tools as soon as their dependencies are met. This is done through multi-threading. We will combine the task fetching unit and exector below:
-#
-# ![diagram](./img/diagram.png)
 @logger.catch
 def _get_observations(messages: List[BaseMessage]) -> Dict[int, Any]:
     # Get all previous tool responses
@@ -322,8 +302,7 @@ def schedule_task(task_inputs, config):
     try:
         observation = _execute_task(task, observations, config)
     except Exception:
-
-        observation = traceback.format_exception()  # repr(e) +
+        observation = traceback.format_exception()
     observations[task["idx"]] = observation
 
 
@@ -422,15 +401,7 @@ def plan_and_schedule(messages: List[BaseMessage], config):
     return scheduled_tasks
 
 
-# #### Example Plan
-#
-# We still haven't introduced any cycles in our computation graph, so this is all easily expressed in LCEL.
-
 tool_messages = plan_and_schedule.invoke([HumanMessage(content=example_question)])
-
-
-# tool_messages
-
 
 # ## "Joiner"
 #
@@ -439,7 +410,8 @@ tool_messages = plan_and_schedule.invoke([HumanMessage(content=example_question)
 # 1. Respond with the correct answer.
 # 2. Loop with a new plan.
 #
-# The paper refers to this as the "joiner". It's another LLM call. We are using function calling to improve parsing reliability.
+# The paper refers to this as the "joiner". It's another LLM call. 
+# We are using function calling to improve parsing reliability.
 
 
 class FinalResponse(BaseModel):
@@ -466,14 +438,12 @@ class JoinOutputs(BaseModel):
 joiner_prompt = hub.pull("wfh/llm-compiler-joiner").partial(
     examples=""
 )  # You can optionally add examples
-# llm = ChatOpenAI(model="gpt-4-turbo-preview")
 
+logger.info(f"\nHere is the llm-compiler joiner_prompt {str(joiner_prompt)}\n")
 runnable = create_structured_output_runnable(JoinOutputs, llm, joiner_prompt)
-
 
 # We will select only the most recent messages in the state, and format the output to be more useful for
 # the planner, should the agent need to loop.
-
 
 @logger.catch
 def _parse_joiner_output(decision: JoinOutputs) -> List[BaseMessage]:
@@ -507,9 +477,9 @@ joiner.invoke(input_messages)
 
 
 # ## 5. Compose using LangGraph
-#
+
 # We'll define the agent as a stateful graph, with the main nodes being:
-#
+
 # 1. Plan and execute (the DAG from the first step above)
 # 2. Join: determine if we should finish or replan
 # 3. Recontextualize: update the graph state based on the output from the joiner
@@ -536,65 +506,70 @@ chain = graph_builder.compile()
 
 
 # #### Multi-hop question
+    # [
+    #     HumanMessage(
+    #         content="What was the GDP of Australia in 2020 in in Billions of US Dollars? \
+    #  What was the GDP of Iceland in 2020 in Billions of US Dollars? Which has the larger GDP? \
+    #     What is the sum of the GDPs, in Billions of US Dollars"
+    #     )
+    # ],
+inp = input("what is your question?")
 
 for step in chain.stream(
     [
         HumanMessage(
-            content="What was the GDP of Australia in 2020 in in Billions of US Dollars? \
-     What was the GDP of Canada in 2020 in Billions of US Dollars? Which country has the larger GDP? \
-        What is the sum of the GDPs of the two countries, in Billions of US Dollars"
+            content=inp
         )
     ],
     {
         "recursion_limit": RECURSION_LIMIT,
     },
 ):
-    print(step)
-    print("---")
+    logger.info(str(step))
 
 
 # #### Multi-hop question
 #
 # This question requires that the agent perform multiple searches.
 
-steps = chain.stream(
-    [
-        HumanMessage(
-            content="Who is the oldest person alive? and how much older is that person than the average human lifespan \
-                in the country where they were born ?"
-        )
-    ],
-    {
-        "recursion_limit": RECURSION_LIMIT,
-    },
-)
-for i, step in enumerate(steps):
-    print(i, step)
-    print("---")
+# steps = chain.stream(
+#     [
+#         HumanMessage(
+#             content="Who is the oldest person alive? and how much older is that person than the average human lifespan \
+#                 in the country where they were born ?"
+#         )
+#     ],
+#     {
+#         "recursion_limit": RECURSION_LIMIT,
+#     },
+# )
+# for i, step in enumerate(steps):
+#     print(i, step)
+#     print("---")
 
 
-# Next Question
-for i,step in enumerate(chain.stream(
-    [
-        HumanMessage(
-            content="What's (3*3245) + 8? What's 32/4.23? What's the sum of those two values?"
-        )
-    ],
-    {
-        "recursion_limit": RECURSION_LIMIT,
-    },
-)):
-    # print(f"\nstep{i}:{str(step)}")
-    print("---")
-    logger.info(f"\nstep{i}:{str(step)}")
+# # Next Question
+# for i,step in enumerate(chain.stream(
+#     [
+#         HumanMessage(
+#             content="What's (3*3245) + 8? What's 32/4.23? What's the sum of those two values?"
+#         )
+#     ],
+#     {
+#         "recursion_limit": RECURSION_LIMIT,
+#     },
+# )):
+#     # print(f"\nstep{i}:{str(step)}")
+#     print("---")
+#     logger.info(f"\nstep{i}:{str(step)}")
 
 
 # ## Conclusion
 #
-# Congrats on building your first LLMCompiler agent! 
+# Congrats on building your first LLMCompiler agent!
 # I'll leave you with some known limitations to the implementation above:
 #
-'''
+"""
 # 1. The planner output parsing format is fragile if your function requires more than 1 or 2 arguments. 
     # We could make it more robust by using streaming tool calling.
 # 2. Variable substitution is fragile in the example above. 
@@ -602,4 +577,4 @@ for i,step in enumerate(chain.stream(
     # and a more robust syntax (using e.g., Lark or a tool calling schema)
 # 3. The state can grow quite long if you require multiple re-planning runs. 
     # To handle, you could add a message compressor once you go above a certain token limit.
-'''
+"""
